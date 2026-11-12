@@ -1,6 +1,7 @@
 """Các provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 import uuid
@@ -13,6 +14,115 @@ CONFIG = {
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
+_QUOTA_HEADERS = {
+    'retry-after',
+    'ratelimit-limit', 'ratelimit-remaining', 'ratelimit-reset',
+    'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-ratelimit-reset',
+    'x-ratelimit-resource',
+}
+_SECRET_PATTERNS = (
+    re.compile(r'(?i)\bAIza[0-9A-Za-z_-]{20,}\b'),
+    re.compile(r'(?i)\bBearer\s+\S+'),
+    re.compile(
+        r'(?i)\b(api[_ -]?key|key|access[_ -]?token|refresh[_ -]?token|'
+        r'token|secret|password|credential|authorization)\b'
+        r'(\s*[:=]\s*|\s+)(["\']?)[^\s,;}]+'
+    ),
+)
+
+
+def _safe_diagnostic_value(value, secrets=()):
+    text = str(value)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, '[REDACTED]')
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub('[REDACTED]', text)
+    return text[:240]
+
+
+def _error_diagnostic(exc, request_headers):
+    headers = exc.headers
+    content_type = ''
+    if headers:
+        content_type = _safe_diagnostic_value(headers.get('Content-Type', ''))[:100]
+
+    secrets = []
+    for name, value in request_headers.items():
+        if name.lower() in {'authorization', 'x-api-key', 'x-goog-api-key'}:
+            value = str(value)
+            secrets.append(value)
+            if value.lower().startswith('bearer '):
+                secrets.append(value[7:])
+
+    try:
+        body = exc.read(65537)
+        if len(body) > 65536:
+            raise ValueError('response body exceeds diagnostic limit')
+        data = json.loads(body.decode('utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {'status': exc.code, 'contentType': content_type}
+
+    error = data.get('error') if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return {'status': exc.code, 'contentType': content_type}
+
+    diagnostic = {'status': exc.code}
+    for source, target in (('code', 'apiCode'), ('status', 'apiStatus'),
+                           ('message', 'message')):
+        value = error.get(source)
+        if isinstance(value, (str, int, float)):
+            diagnostic[target] = _safe_diagnostic_value(value, secrets)
+
+    allowed_fields = {
+        'quotaMetric': 'quotaMetric', 'quota_metric': 'quotaMetric',
+        'quotaId': 'quotaId', 'quota_id': 'quotaId',
+        'quotaValue': 'quotaValue', 'quota_value': 'quotaValue',
+        'quotaLimit': 'quotaValue', 'quota_limit': 'quotaValue',
+        'retryDelay': 'retryDelay', 'retry_delay': 'retryDelay',
+        'model': 'model', 'reason': 'reason',
+        'location': 'quotaLocation',
+    }
+
+    def collect(mapping, values):
+        for key, target in allowed_fields.items():
+            value = mapping.get(key)
+            if isinstance(value, (str, int, float)):
+                safe_value = _safe_diagnostic_value(value, secrets)
+                if safe_value:
+                    values.setdefault(target, safe_value)
+
+    values = {}
+    details = error.get('details')
+    if isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            collect(detail, values)
+            for nested_key in ('metadata', 'quotaDimensions', 'quota_dimensions'):
+                nested = detail.get(nested_key)
+                if isinstance(nested, dict):
+                    collect(nested, values)
+            violations = detail.get('violations')
+            if isinstance(violations, list):
+                for violation in violations:
+                    if isinstance(violation, dict):
+                        collect(violation, values)
+                        nested = violation.get('quotaDimensions')
+                        if isinstance(nested, dict):
+                            collect(nested, values)
+    diagnostic.update(values)
+
+    safe_headers = {}
+    if headers:
+        for name, value in headers.items():
+            normalized = name.lower()
+            if normalized in _QUOTA_HEADERS:
+                safe_headers[normalized] = _safe_diagnostic_value(value, secrets)
+    if safe_headers:
+        diagnostic['headers'] = safe_headers
+    return diagnostic
+
 
 def post_json(url, headers, payload):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
@@ -21,7 +131,15 @@ def post_json(url, headers, payload):
             return json.load(response)
     except urllib.error.HTTPError as exc:
         # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        message = f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.'
+        if (exc.code == 429 and url == CONFIG['gemini'][1]
+                and os.getenv('GEMINI_HTTP_DIAGNOSTICS') == '1'):
+            message += ' Diagnostic: ' + json.dumps(
+                _error_diagnostic(exc, headers),
+                ensure_ascii=True,
+                separators=(',', ':'),
+            )
+        raise RuntimeError(message) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
